@@ -5,6 +5,7 @@ import (
 	"time"
 
 	. "github.com/flynn/flynn/Godeps/_workspace/src/github.com/flynn/go-check"
+	cc "github.com/flynn/flynn/controller/client"
 	ct "github.com/flynn/flynn/controller/types"
 )
 
@@ -29,17 +30,17 @@ func (s *S) TestEvents(c *C) {
 	c.Assert(listener.Listen(), IsNil)
 
 	// sub1 should receive job events for app1, job1
-	sub1, err := listener.Subscribe(app1.ID, string(ct.EventTypeJob), jobID1)
+	sub1, err := listener.Subscribe(app1.ID, []string{string(ct.EventTypeJob)}, jobID1)
 	c.Assert(err, IsNil)
 	defer sub1.Close()
 
 	// sub2 should receive all job events for app1
-	sub2, err := listener.Subscribe(app1.ID, string(ct.EventTypeJob), "")
+	sub2, err := listener.Subscribe(app1.ID, []string{string(ct.EventTypeJob)}, "")
 	c.Assert(err, IsNil)
 	defer sub2.Close()
 
 	// sub3 should receive all job events for app2
-	sub3, err := listener.Subscribe(app2.ID, "", "")
+	sub3, err := listener.Subscribe(app2.ID, []string{}, "")
 	c.Assert(err, IsNil)
 	defer sub3.Close()
 
@@ -77,4 +78,37 @@ func (s *S) TestEvents(c *C) {
 	assertJobEvents(sub1, jobs[0:2])
 	assertJobEvents(sub2, jobs[0:4])
 	assertJobEvents(sub3, jobs[4:6])
+}
+
+func (s *S) TestStreamEventsWithoutApp(c *C) {
+	events := make(chan *ct.Event)
+	stream, err := s.c.StreamEvents(cc.StreamEventsOptions{}, events)
+	c.Assert(err, IsNil)
+	defer stream.Close()
+
+	// send fake event
+
+	type FakeEvent struct {
+		Message string `json:"message"`
+	}
+
+	createEvent := func(e FakeEvent) {
+		data, err := json.Marshal(e)
+		c.Assert(err, IsNil)
+		query := "INSERT INTO events (object_id, object_type, data) VALUES ($1, $2, $3)"
+		c.Assert(s.hc.db.Exec(query, "fake-id", string(ct.EventTypeScale), data), IsNil)
+	}
+	createEvent(FakeEvent{Message: "payload"})
+
+	select {
+	case e, ok := <-events:
+		if !ok {
+			c.Fatal("unexpected close of event stream")
+		}
+		var event FakeEvent
+		c.Assert(json.Unmarshal(e.Data, &event), IsNil)
+		c.Assert(event.Message, Equals, "payload")
+	case <-time.After(time.Second):
+		c.Fatal("Timed out waiting for event")
+	}
 }

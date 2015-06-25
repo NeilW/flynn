@@ -26,14 +26,26 @@ func NewEventRepo(db *postgres.DB) *EventRepo {
 	return &EventRepo{db: db}
 }
 
-func (r *EventRepo) ListEvents(appID, typ, objectID string, sinceID int64, count int) ([]*ct.Event, error) {
-	query := "SELECT event_id, app_id, object_id, object_type, data, created_at FROM events WHERE app_id = $1 AND event_id > $2"
-	args := []interface{}{appID, sinceID}
-	n := 3
-	if typ != "" {
-		query += fmt.Sprintf(" AND object_type = $%d", n)
+func (r *EventRepo) ListEvents(appID string, objectTypes []string, objectID string, sinceID int64, count int) ([]*ct.Event, error) {
+	query := "SELECT event_id, app_id, object_id, object_type, data, created_at FROM events WHERE event_id > $1"
+	args := []interface{}{sinceID}
+	n := 2
+	if appID != "" {
+		query += fmt.Sprintf(" AND app_id = $%d", n)
 		n++
-		args = append(args, typ)
+		args = append(args, appID)
+	}
+	if len(objectTypes) > 0 {
+		query += " AND ("
+		for i, typ := range objectTypes {
+			if i > 0 {
+				query += " OR "
+			}
+			query += fmt.Sprintf("object_type = $%d", n)
+			n++
+			args = append(args, typ)
+		}
+		query += ")"
 	}
 	if objectID != "" {
 		query += fmt.Sprintf(" AND object_id = $%d", n)
@@ -69,14 +81,17 @@ func scanEvent(s postgres.Scanner) (*ct.Event, error) {
 	var event ct.Event
 	var typ string
 	var data []byte
-	err := s.Scan(&event.ID, &event.AppID, &event.ObjectID, &typ, &data, &event.CreatedAt)
+	var appID *string
+	err := s.Scan(&event.ID, &appID, &event.ObjectID, &typ, &data, &event.CreatedAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			err = ErrNotFound
 		}
 		return nil, err
 	}
-	event.AppID = postgres.CleanUUID(event.AppID)
+	if appID != nil {
+		event.AppID = postgres.CleanUUID(*appID)
+	}
 	event.ObjectType = ct.EventType(typ)
 	event.Data = json.RawMessage(data)
 	return &event, nil
@@ -96,12 +111,17 @@ func (c *controllerAPI) Events(ctx context.Context, w http.ResponseWriter, req *
 	if err := c.maybeStartEventListener(); err != nil {
 		respondWithError(w, err)
 	}
-	if err := streamEvents(ctx, w, req, c.eventListener, c.getApp(ctx), c.eventRepo); err != nil {
+	if err := streamEvents(ctx, w, req, c.eventListener, c.maybeGetApp(ctx), c.eventRepo); err != nil {
 		respondWithError(w, err)
 	}
 }
 
 func streamEvents(ctx context.Context, w http.ResponseWriter, req *http.Request, eventListener *EventListener, app *ct.App, repo *EventRepo) (err error) {
+	var appID string
+	if app != nil {
+		appID = app.ID
+	}
+
 	var lastID int64
 	if req.Header.Get("Last-Event-Id") != "" {
 		lastID, err = strconv.ParseInt(req.Header.Get("Last-Event-Id"), 10, 64)
@@ -118,12 +138,15 @@ func streamEvents(ctx context.Context, w http.ResponseWriter, req *http.Request,
 		}
 	}
 
-	objectType := req.FormValue("object_type")
+	objectTypes := strings.Split(req.FormValue("object_types"), ",")
+	if len(objectTypes) == 1 && objectTypes[0] == "" {
+		objectTypes = []string{}
+	}
 	objectID := req.FormValue("object_id")
 	past := req.FormValue("past")
 
 	l, _ := ctxhelper.LoggerFromContext(ctx)
-	log := l.New("fn", "Events", "object_type", objectType, "object_id", objectID)
+	log := l.New("fn", "Events", "object_types", objectTypes, "object_id", objectID)
 	ch := make(chan *ct.Event)
 	s := sse.NewStream(w, ch, log)
 	s.Serve()
@@ -135,7 +158,7 @@ func streamEvents(ctx context.Context, w http.ResponseWriter, req *http.Request,
 		}
 	}()
 
-	sub, err := eventListener.Subscribe(app.ID, objectType, objectID)
+	sub, err := eventListener.Subscribe(appID, objectTypes, objectID)
 	if err != nil {
 		return err
 	}
@@ -143,7 +166,7 @@ func streamEvents(ctx context.Context, w http.ResponseWriter, req *http.Request,
 
 	var currID int64
 	if past == "true" || lastID > 0 {
-		list, err := repo.ListEvents(app.ID, objectType, objectID, lastID, count)
+		list, err := repo.ListEvents(appID, objectTypes, objectID, lastID, count)
 		if err != nil {
 			return err
 		}
@@ -178,17 +201,17 @@ var ErrEventBufferOverflow = errors.New("event stream buffer overflow")
 // eventBufferSize is the amount of events to buffer in memory.
 const eventBufferSize = 1000
 
-// EventSubscriber receives app events from the EventListener loop and maintains
+// EventSubscriber receives events from the EventListener loop and maintains
 // it's own loop to forward those events to the Events channel.
 type EventSubscriber struct {
 	Events chan *ct.Event
 	Err    error
 
-	l          *EventListener
-	queue      chan *ct.Event
-	appID      string
-	objectType string
-	objectID   string
+	l           *EventListener
+	queue       chan *ct.Event
+	appID       string
+	objectTypes []string
+	objectID    string
 
 	stop     chan struct{}
 	stopOnce sync.Once
@@ -197,8 +220,17 @@ type EventSubscriber struct {
 // Notify filters the event based on it's type and objectID and then pushes
 // it to the event queue.
 func (e *EventSubscriber) Notify(event *ct.Event) {
-	if e.objectType != "" && e.objectType != string(event.ObjectType) {
-		return
+	if len(e.objectTypes) > 0 {
+		foundType := false
+		for _, typ := range e.objectTypes {
+			if typ == string(event.ObjectType) {
+				foundType = true
+				break
+			}
+		}
+		if !foundType {
+			return
+		}
 	}
 	if e.objectID != "" && e.objectID != event.ObjectID {
 		return
@@ -242,7 +274,7 @@ func newEventListener(r *EventRepo) *EventListener {
 	}
 }
 
-// EventListener creates a postgres Listener for app events and forwards them
+// EventListener creates a postgres Listener for events and forwards them
 // to subscribers.
 type EventListener struct {
 	eventRepo *EventRepo
@@ -255,20 +287,21 @@ type EventListener struct {
 }
 
 // Subscribe creates and returns an EventSubscriber for the given app, type and object.
-func (e *EventListener) Subscribe(appID, objectType, objectID string) (*EventSubscriber, error) {
+// Using an empty string for appID subscribes to all apps
+func (e *EventListener) Subscribe(appID string, objectTypes []string, objectID string) (*EventSubscriber, error) {
 	e.subMtx.Lock()
 	defer e.subMtx.Unlock()
 	if e.IsClosed() {
 		return nil, errors.New("event listener closed")
 	}
 	s := &EventSubscriber{
-		Events:     make(chan *ct.Event),
-		l:          e,
-		queue:      make(chan *ct.Event, eventBufferSize),
-		stop:       make(chan struct{}),
-		appID:      appID,
-		objectType: objectType,
-		objectID:   objectID,
+		Events:      make(chan *ct.Event),
+		l:           e,
+		queue:       make(chan *ct.Event, eventBufferSize),
+		stop:        make(chan struct{}),
+		appID:       appID,
+		objectTypes: objectTypes,
+		objectID:    objectID,
 	}
 	go s.loop()
 	if _, ok := e.subscribers[appID]; !ok {
@@ -290,7 +323,7 @@ func (e *EventListener) Unsubscribe(s *EventSubscriber) {
 	}
 }
 
-// Listen creates a postgres listener for app events and starts a goroutine to
+// Listen creates a postgres listener for events and starts a goroutine to
 // forward the events to subscribers.
 func (e *EventListener) Listen() error {
 	log := log15.New("component", "controller", "fn", "EventListener.Listen")
@@ -307,18 +340,18 @@ func (e *EventListener) Listen() error {
 				return
 			}
 			idApp := strings.SplitN(n.Extra, ":", 2)
-			if len(idApp) != 2 {
-				log.Error(fmt.Sprintf("invalid app event notification: %q", n.Extra))
+			if len(idApp) < 1 {
+				log.Error(fmt.Sprintf("invalid event notification: %q", n.Extra))
 				continue
 			}
 			id, err := strconv.ParseInt(idApp[0], 10, 64)
 			if err != nil {
-				log.Error(fmt.Sprintf("invalid app event notification: %q", n.Extra), "err", err)
+				log.Error(fmt.Sprintf("invalid event notification: %q", n.Extra), "err", err)
 				continue
 			}
 			event, err := e.eventRepo.GetEvent(id)
 			if err != nil {
-				log.Error(fmt.Sprintf("invalid app event notification: %q", n.Extra), "err", err)
+				log.Error(fmt.Sprintf("invalid event notification: %q", n.Extra), "err", err)
 				continue
 			}
 			e.Notify(event)

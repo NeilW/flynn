@@ -206,6 +206,8 @@ func appHandler(c handlerConfig) http.Handler {
 	httpRouter.GET("/apps/:apps_id/routes/:routes_type/:routes_id", httphelper.WrapHandler(api.appLookup(api.GetRoute)))
 	httpRouter.DELETE("/apps/:apps_id/routes/:routes_type/:routes_id", httphelper.WrapHandler(api.appLookup(api.DeleteRoute)))
 
+	httpRouter.GET("/events", httphelper.WrapHandler(api.Events))
+
 	return httphelper.ContextInjector("controller",
 		httphelper.NewRequestLogger(muxHandler(httpRouter, c.keys)))
 }
@@ -257,6 +259,13 @@ type controllerAPI struct {
 
 func (c *controllerAPI) getApp(ctx context.Context) *ct.App {
 	return ctx.Value("app").(*ct.App)
+}
+
+func (c *controllerAPI) maybeGetApp(ctx context.Context) *ct.App {
+	if app, ok := ctx.Value("app").(*ct.App); ok {
+		return app
+	}
+	return nil
 }
 
 func (c *controllerAPI) getRelease(ctx context.Context) (*ct.Release, error) {

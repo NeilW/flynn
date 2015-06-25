@@ -199,7 +199,7 @@ func (c *Client) UpdateApp(app *ct.App) error {
 // DeleteApp deletes an app.
 func (c *Client) DeleteApp(appID string) (*ct.AppDeletion, error) {
 	events := make(chan *ct.Event)
-	stream, err := c.ResumingStream("GET", fmt.Sprintf("/apps/%s/events?object_type=%s", appID, ct.EventTypeAppDeletion), events)
+	stream, err := c.ResumingStream("GET", fmt.Sprintf("/apps/%s/events?object_types=%s", appID, ct.EventTypeAppDeletion), events)
 	if err != nil {
 		return nil, err
 	}
@@ -435,7 +435,7 @@ func convertEvents(appEvents chan *ct.Event, outputCh interface{}) {
 func (c *Client) StreamDeployment(d *ct.Deployment, output chan *ct.DeploymentEvent) (stream.Stream, error) {
 	appEvents := make(chan *ct.Event)
 	go convertEvents(appEvents, output)
-	return c.ResumingStream("GET", fmt.Sprintf("/apps/%s/events?object_type=%s&object_id=%s&past=true", d.AppID, ct.EventTypeDeployment, d.ID), appEvents)
+	return c.ResumingStream("GET", fmt.Sprintf("/apps/%s/events?object_types=%s&object_id=%s&past=true", d.AppID, ct.EventTypeDeployment, d.ID), appEvents)
 }
 
 func (c *Client) DeployAppRelease(appID, releaseID string) error {
@@ -480,7 +480,7 @@ outer:
 func (c *Client) StreamJobEvents(appID string, output chan *ct.JobEvent) (stream.Stream, error) {
 	appEvents := make(chan *ct.Event)
 	go convertEvents(appEvents, output)
-	return c.ResumingStream("GET", fmt.Sprintf("/apps/%s/events?object_type=%s", appID, ct.EventTypeJob), appEvents)
+	return c.ResumingStream("GET", fmt.Sprintf("/apps/%s/events?object_types=%s", appID, ct.EventTypeJob), appEvents)
 }
 
 func (c *Client) WatchJobEvents(appID, releaseID string) (*JobWatcher, error) {
@@ -490,6 +490,35 @@ func (c *Client) WatchJobEvents(appID, releaseID string) (*JobWatcher, error) {
 		return nil, err
 	}
 	return newJobWatcher(events, stream, releaseID), nil
+}
+
+type StreamEventsOptions struct {
+	AppID       string
+	ObjectTypes []ct.EventType
+	ObjectID    string
+}
+
+func (c *Client) StreamEvents(opts StreamEventsOptions, output chan *ct.Event) (stream.Stream, error) {
+	path, err := url.Parse("/events")
+	if err != nil {
+		return nil, err
+	}
+	q := path.Query()
+	if opts.AppID != "" {
+		q.Set("app_id", opts.AppID)
+	}
+	if len(opts.ObjectTypes) > 0 {
+		types := make([]string, len(opts.ObjectTypes))
+		for i, t := range opts.ObjectTypes {
+			types[i] = string(t)
+		}
+		q.Set("object_types", strings.Join(types, ","))
+	}
+	if opts.ObjectID != "" {
+		q.Set("object_id", opts.ObjectID)
+	}
+	path.RawQuery = q.Encode()
+	return c.ResumingStream("GET", path.String(), output)
 }
 
 func (c *Client) ExpectedScalingEvents(actual, expected map[string]int, releaseProcesses map[string]ct.ProcessType, clusterSize int) ct.JobEvents {
